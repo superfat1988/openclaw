@@ -1,0 +1,129 @@
+name: Build Android Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: Android flavor to build
+        type: choice
+        required: true
+        default: play
+        options:
+          - play
+          - thirdParty
+
+jobs:
+  build:
+    name: Build ${{ inputs.flavor }} release APK
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+          cache-dependency-path: |
+            apps/android/**/*.gradle*
+            apps/android/**/gradle-wrapper.properties
+            apps/android/gradle/libs.versions.toml
+
+      - name: Cache Android SDK
+        uses: actions/cache@v5
+        with:
+          path: ~/.android-sdk
+          key: ${{ runner.os }}-android-sdk-v1-cmdline-12266719-platform-36-build-tools-36.0.0
+          restore-keys: |
+            ${{ runner.os }}-android-sdk-v1-
+
+      - name: Setup Android SDK cmdline-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANDROID_SDK_ROOT="$HOME/.android-sdk"
+          CMDLINE_TOOLS_VERSION="12266719"
+          ARCHIVE="commandlinetools-linux-${CMDLINE_TOOLS_VERSION}_latest.zip"
+          URL="https://dl.google.com/android/repository/${ARCHIVE}"
+
+          if [ ! -x "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+            curl -fsSL "$URL" -o "/tmp/${ARCHIVE}"
+            rm -rf "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+            unzip -q "/tmp/${ARCHIVE}" -d "$ANDROID_SDK_ROOT/cmdline-tools"
+            mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          fi
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --licenses >/dev/null
+          sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Restore signing keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android-signing"
+          printf '%s' "${{ secrets.OPENCLAW_ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$HOME/.android-signing/openclaw-release.jks"
+          chmod 600 "$HOME/.android-signing/openclaw-release.jks"
+
+      - name: Configure Gradle signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.gradle"
+          cat >> "$HOME/.gradle/gradle.properties" <<EOF_GRADLE
+          OPENCLAW_ANDROID_STORE_FILE=$HOME/.android-signing/openclaw-release.jks
+          OPENCLAW_ANDROID_STORE_PASSWORD=${{ secrets.OPENCLAW_ANDROID_STORE_PASSWORD }}
+          OPENCLAW_ANDROID_KEY_ALIAS=${{ secrets.OPENCLAW_ANDROID_KEY_ALIAS }}
+          OPENCLAW_ANDROID_KEY_PASSWORD=${{ secrets.OPENCLAW_ANDROID_KEY_PASSWORD }}
+          EOF_GRADLE
+          chmod 600 "$HOME/.gradle/gradle.properties"
+
+      - name: Build release APK
+        working-directory: apps/android
+        shell: bash
+        env:
+          FLAVOR: ${{ inputs.flavor }}
+        run: |
+          set -euo pipefail
+          case "$FLAVOR" in
+            play)
+              ./gradlew --no-daemon :app:assemblePlayRelease
+              ;;
+            thirdParty)
+              ./gradlew --no-daemon :app:assembleThirdPartyRelease
+              ;;
+            *)
+              echo "Unsupported flavor: $FLAVOR" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: List APK outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          find apps/android/app/build/outputs/apk -type f -name '*.apk' -print -exec ls -lh {} \;
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-android-${{ inputs.flavor }}-release-apk
+          path: apps/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
